@@ -1,0 +1,211 @@
+/*********************************************************************************************************************
+** UFM_BIS_CFG.MGFHQT
+** Copyright (c) 2015 CJSC PETER-SERVICE.
+** Мера "Нотификация об изменении LC-статуса с «Активен» на «Приостановлен по балансу»"
+** Нотификация об изменении LC-статуса с «Активен» на «Приостановлен по балансу»
+** Версия 004.00,  20.04.2015
+*********************************************************************************************************************
+*/
+template header
+CONDITION_ID
+SANCTION_ID
+SANCTION_STATUS_ID
+
+package com.peterservice.ufm.kernel
+
+import com.peterservice.ufm.model.telecom.Client;
+import com.peterservice.ufm.model.telecom.Subscriber;
+import com.peterservice.ufm.model.sanction.SanctionExec;
+import com.peterservice.ufm.model.sanction.SanctionState;
+import com.peterservice.ufm.model.message.MessageInfo;
+import com.peterservice.ufm.model.telecom.Service;
+import com.peterservice.ufm.cache.Sequence;
+import com.peterservice.ufm.model.common.attributes.Attributes;
+import com.peterservice.ufm.model.common.Constants;
+import com.peterservice.ufm.model.common.IBusinessObject;
+import com.peterservice.ufm.model.telecom.Threshold;
+import com.peterservice.ufm.model.sanction.PlanConfig;
+import com.peterservice.ufm.model.sanction.PlanBuilder;
+import com.peterservice.ufm.settings.Settings;
+import com.peterservice.ufm.model.telecom.BisCfgConstants;
+import com.peterservice.ufm.model.sanction.Sanction;
+import java.math.BigDecimal;
+import java.util.Date;
+import java.util.ArrayList;
+import java.util.HashMap;
+import org.slf4j.Logger;
+import java.util.Calendar;
+import java.math.RoundingMode;
+import com.peterservice.ufm.model.telecom.calculate.TimeCalculate;
+import org.joda.time.LocalDateTime;
+import org.joda.time.DateTime;
+import org.joda.time.DateTimeZone;
+import java.util.TimeZone;
+
+global ArrayList<MessageInfo> resultMessageInfoList;
+global ArrayList<MessageInfo> postponeMessageInfoList;
+
+template "BalanceBreakNotifyApply"
+
+rule "BalanceBreakNotifyApplyRule_@{row.rowNumber}"
+
+no-loop
+
+    when
+        $clnt : Client( $clntId : getObjectId(),
+                        $datasourceId: getDataSourceId(),
+                        getLongAttribute(Constants.CLIENT_CATEGORY) == 1L /*Предоплатный*/
+                        )
+
+        commonClientCheck ( $clnt : client) //обязательная проверка клиента на необходимость контроля
+
+        //проверка атрибутики клиента на разрешенность нотификации
+        checkClientAttributesForNotify($clnt;)
+        //проверка абонента
+        $subs : Subscriber($subsId : getObjectId())
+        // проверка атрибутики абонента на разрешенность нотификации
+        checkSubsAttributesForNotify($subs;)
+
+        $settings : Settings($parameters : getParameters())
+
+        // получение услуги "статус инфо"
+        // статус услуги должен быть 'Подключена' или 'Заказана/ожидание оплаты'
+        bisService :=   Service(getLongAttribute(BisCfgConstants.SRST_ID) == 4L ||
+                                getLongAttribute(BisCfgConstants.SRST_ID) == 2L,
+                                String.valueOf($parameters.getNumberValue('BALANCE_BREAK_INFO_SRLS_ID', $subs.getDataSourceId())) == getKey()
+                                  ) from $subs.getBisServiceValues()
+
+        Client (// Значение атрибута клиента RTST_ID равно 3 (Приостановлен по балансу)
+                getLongAttribute(Constants.CLIENT_RT_STATUS) == 3L,
+                // Предыдущее значение атрибута клиента RTST_ID равно 0 (Активен)
+                $clnt.getLongAttribute(Constants.PREV_CLIENT_RT_STATUS) == 0L)
+
+        //берем Sanction, для которой выполняется правило
+        $sanction : Sanction ( ) from $settings.getPlanConfig.getSanctionById(@{SANCTION_ID})
+
+        $attributes : Attributes( ) from $sanction.getAttributes()
+        $balanceType := String ( ) from ($attributes.getStringAttribute(BisCfgConstants.BALANCE_TYPE) == null ?
+            BalanceType.VIRTUAL.toString() : $attributes.getStringAttribute(BisCfgConstants.BALANCE_TYPE) )
+
+        //получаем баланс с учетом Credit XL
+        getBalanceCreditXLByType($clnt, $balanceType; $balance := balance)
+
+        //проверяем, есть ли у абонента персональный счет
+        not ( hasPersonalClient($subs : subscriber) )
+
+        not (exists (
+                      SanctionExec( getObjectId() != null,
+                                    getClientId() == $clntId,
+                                    getSubscriberId() == $subsId,
+                                    getServiceId() == null,
+                                    getSancId() == @{SANCTION_ID},
+                                    getState() == SanctionState.A
+                                    ) from $clnt.getSanctionExecs()
+                       )
+               )
+
+        //==================================================================================================================
+        // Системная часть
+        //==================================================================================================================
+            // проверка  условия применения меры
+            Settings(getPlanConfig().canApplySanction4Client($clnt, @{CONDITION_ID}))
+            // Объект для логирования
+            $logger : Logger()
+            // Объект для создания исполнений мер
+            $planBuilder : PlanBuilder()
+
+        //==================================================================================================================
+    then
+        Date date = new Date();
+        if ($logger.isTraceEnabled()) {
+            $logger.trace("Execute rule BalanceBreakNotifyApplyRule: sancId={}, for clntId={}, subsId ={}, balanceType ={}",
+                    @{SANCTION_ID}, $clntId,  $subsId, $balanceType);
+        }
+
+        SanctionExec sanctionExec = $planBuilder.buildSanctionExec(
+                                                    $datasourceId,
+                                                    $clntId,
+                                                    $subsId,
+                                                    null,
+                                                    @{SANCTION_ID},
+                                                    @{SANCTION_STATUS_ID}, // /*STATUS*/,
+                                                    SanctionState.A /*STATE*/,
+                                                    new Date());
+
+        // Добавляем атрибуты меры
+        sanctionExec.getAttributes().putStringAttribute(BisCfgConstants.SMS_PHONE_NUMBER_TO, $subs.getStringAttribute(Constants.MSISDN), date);
+        sanctionExec.getAttributes().putLongAttribute(BisCfgConstants.SMS_MSG_TYPE_ID,
+            $parameters.getNumberValue("BALANCE_BREAK_SMST_ID").longValue(), date);
+        sanctionExec.getAttributes().putLongAttribute(BisCfgConstants.SMS_CUSTOMER_ID, Long.valueOf($clntId), date);
+
+		//Если текущее время в диапазоне <атрибут меры SMS_START_SEND_HOUR>-<атрибут меры SMS_END_SEND_HOUR>, устанавливать текущее значение,
+		//иначе устанавливать дату: следующий день <атрибут меры SMS_START_SEND_HOUR>.
+        TimeZone timeZone = TimeCalculate.getBisTimeZone($settings, $clnt);
+        if(timeZone == null) {
+            timeZone = TimeZone.getDefault();
+        }
+        DateTime dateTime = DateTime.now().withZone(DateTimeZone.forTimeZone(timeZone));
+        BigDecimal currentTime = BigDecimal.valueOf(dateTime.getHourOfDay());
+        Date sendDate = dateTime.toDate();
+        // SMS_START_SEND_HOUR > currentTime
+   	    if ($sanction.getAttributes().getBigDecimalAttribute(BisCfgConstants.SMS_START_SEND_HOUR).compareTo(currentTime) > 0 ){
+		   sendDate = dateTime.withHourOfDay(($sanction.getAttributes().getBigDecimalAttribute(BisCfgConstants.SMS_START_SEND_HOUR)).intValue())
+		                    .withMinuteOfHour(0)
+                            .withSecondOfMinute(0)
+                            .toDate();
+        }
+        // currentTime > SMS_END_SEND_HOUR
+        else if ($sanction.getAttributes().getBigDecimalAttribute(BisCfgConstants.SMS_END_SEND_HOUR).compareTo(currentTime) <= 0 ){
+		   sendDate = dateTime.plusDays(1)
+		                        .withHourOfDay(($sanction.getAttributes().getBigDecimalAttribute(BisCfgConstants.SMS_START_SEND_HOUR)).intValue())
+                                .withMinuteOfHour(0)
+                                .withSecondOfMinute(0)
+                                .toDate();
+        }
+        sanctionExec.getAttributes().putDateAttribute(BisCfgConstants.SMS_ORDER_SEND_DATE, sendDate , date);
+
+		sanctionExec.getAttributes().putDateAttribute(BisCfgConstants.SMS_EXPIRE_DATE, new Date(date.getTime() +
+		    $parameters.getNumberValue("BALANCE_BREAK_SMS_EXPIRE_DAY").longValue()*24*60*60*1000L ), date);
+
+        // Формируем текст сообщения
+        String messageText;
+        Service service = $subs.findBisService(String.valueOf($parameters.getNumberValue("CREDIT_XL_SRLS_ID", $datasourceId)), $datasourceId);
+        if (service != null && (service.getLongAttribute(BisCfgConstants.SRST_ID) == 4L || service.getLongAttribute(BisCfgConstants.SRST_ID) == 2L)) {
+            // У абонента подключена услуга «Кредит XL»
+            messageText = $parameters.getStringValue("BALANCE_BREAK_SMS_TEXT_CREDIT_XL");
+        } else {
+            Calendar calendar = Calendar.getInstance();
+            Date activationDate = $subs.getDateAttribute("ACTIVATION_DATE") ;
+            calendar.setTime(activationDate == null ? date : activationDate);
+            calendar.add(Calendar.MONTH, $parameters.getNumberValue("MIN_SERVICE_PERIOD_FOR_AUTOPAY").intValue());
+            service = $subs.findBisService(String.valueOf($parameters.getNumberValue("CREDIBILITY_SRLS_ID", $datasourceId)), $datasourceId);
+            if (
+                // Не подключена услуга «Кредит доверия»
+                (service == null || service.getLongAttribute(BisCfgConstants.SRST_ID) != 4L && service.getLongAttribute(BisCfgConstants.SRST_ID) != 2L)
+                // Дата начала обслуживания абонента (атрибут абонента ACTIVATION_DATE) + число месяцев из параметра MIN_SERVICE_PERIOD_FOR_AUTOPAY < текущая дата
+                && calendar.getTime().before(date)
+                // Баланс < значения параметра MAX_DEBT_FOR_AUTOPAY
+                && $balance.compareTo($parameters.getNumberValue("MAX_DEBT_FOR_AUTOPAY")) < 0
+            ) {
+                // доступен обещанный платеж
+                messageText = $parameters.getStringValue("BALANCE_BREAK_SMS_TEXT_AUTOPAY");
+            } else {
+                // недоступен обещанный платеж
+                messageText = $parameters.getStringValue("BALANCE_BREAK_SMS_TEXT");
+            }
+        }
+        messageText = messageText.replace("%balance", String.valueOf($balance));
+        sanctionExec.getAttributes().putStringAttribute(BisCfgConstants.SMS_MSG_TEXT, messageText, date);
+
+        String dataSourceCode = $settings.getPlanConfig().getDataSource($datasourceId.intValue()).getCode();
+        sanctionExec.getAttributes().putStringAttribute(BisCfgConstants.SMS_SUBS_DB_ID, dataSourceCode, date);
+
+        // добавляем исполнение в клиента
+        $clnt.putSanctionExec(sanctionExec);
+        // добавляем исполнение в результирующий массив
+        MessageInfo resultMessageInfo = new MessageInfo(IBusinessObject.ObjectType.SE, sanctionExec.getSancId().toString());
+        resultMessageInfo.getSanctionExecList().add(sanctionExec);
+        resultMessageInfoList.add(resultMessageInfo);
+end
+
+end template

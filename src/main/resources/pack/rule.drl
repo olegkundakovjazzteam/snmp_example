@@ -1,0 +1,40 @@
+import pack.Fib;
+
+
+
+
+
+rule "Recurse"
+    dialect "mvel"
+    salience 10
+    when
+        f : Fib ( value == -1 )
+        not ( Fib ( sequence == 1 ) )
+    then
+        insert( new Fib( f.sequence - 1 ) );
+        System.out.println( "recurse for " + f.sequence );
+end
+
+rule Bootstrap
+    dialect "mvel"
+    when
+        f : Fib( sequence == 1 || == 2, value == -1 ) // multi-restriction
+    then
+        modify ( f ){ value = 1 };
+        System.out.println( f.sequence + " == " + f.value );
+end
+
+rule Calculate
+dialect "mvel"
+    when
+        // Bind f1 and s1
+        f1 : Fib( s1 : sequence, value != -1 )
+        // Bind f2 and v2; refer to bound variable s1
+        f2 : Fib( sequence == (s1 + 1), v2 : value != -1 )
+        // Bind f3 and s3; alternative reference of f2.sequence
+        f3 : Fib( s3 : sequence == (f2.sequence + 1 ), value == -1 )
+    then
+        // Note the various referencing techniques.
+        modify ( f3 ) { value = f1.value + v2 };
+        System.out.println( s3 + " == " + f3.value );
+end
